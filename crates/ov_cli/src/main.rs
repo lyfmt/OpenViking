@@ -345,6 +345,9 @@ enum Commands {
         /// Session ID (defaults to machine unique ID)
         #[arg(short, long)]
         session: Option<String>,
+        /// Sender ID
+        #[arg(short, long, default_value = "user")]
+        sender: String,
         /// Stream the response (default: true)
         #[arg(long, default_value_t = true)]
         stream: bool,
@@ -591,13 +594,13 @@ async fn main() {
         Commands::Tui { uri } => {
             handle_tui(uri, ctx).await
         }
-        Commands::Chat { message, session, stream, no_format, no_history } => {
+        Commands::Chat { message, session, sender, stream, no_format, no_history } => {
             let session_id = session.or_else(|| config::get_or_create_machine_id().ok());
             let cmd = commands::chat::ChatCommand {
                 endpoint: std::env::var("VIKINGBOT_ENDPOINT").unwrap_or_else(|_| "http://localhost:1933/bot/v1".to_string()),
                 api_key: std::env::var("VIKINGBOT_API_KEY").ok(),
                 session: session_id,
-                user: "cli_user".to_string(),
+                sender,
                 message,
                 stream,
                 no_format,

@@ -509,6 +509,7 @@ def prepare_agent_channel(
     markdown: bool,
     logs: bool,
     eval: bool = False,
+    sender: str | None = None,
 ):
     """Prepare channel for agent command."""
     from vikingbot.channels.chat import ChatChannel, ChatChannelConfig
@@ -526,6 +527,7 @@ def prepare_agent_channel(
             session_id=session_id,
             markdown=markdown,
             eval=eval,
+            sender=sender,
         )
         channels.add_channel(channel)
     else:
@@ -538,6 +540,7 @@ def prepare_agent_channel(
             session_id=session_id,
             markdown=markdown,
             logs=logs,
+            sender=sender,
         )
         channels.add_channel(channel)
 
@@ -560,6 +563,9 @@ def chat(
     config_path: str = typer.Option(
         None, "--config", "-c", help="Path to ov.conf, default .openviking/ov.conf"
     ),
+    sender: str = typer.Option(
+        None, "--sender", help="Sender ID, same usage as feishu channel sender"
+    ),
 ):
     """Interact with the agent directly."""
     path = Path(config_path).expanduser() if config_path is not None else None
@@ -574,7 +580,7 @@ def chat(
     if session_id is None:
         session_id = get_or_create_machine_id()
     cron = prepare_cron(bus, quiet=is_single_turn)
-    channels = prepare_agent_channel(config, bus, message, session_id, markdown, logs, eval)
+    channels = prepare_agent_channel(config, bus, message, session_id, markdown, logs, eval, sender)
     agent_loop = prepare_agent_loop(
         config, bus, session_manager, cron, quiet=is_single_turn, eval=eval
     )
