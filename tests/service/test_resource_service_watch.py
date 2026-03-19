@@ -22,6 +22,7 @@ async def get_task_by_uri(service: ResourceService, to_uri: str, ctx: RequestCon
         account_id=ctx.account_id,
         user_id=ctx.user.user_id,
         role=ctx.role.value,
+        agent_id=ctx.user.agent_id,
     )
 
 
@@ -265,6 +266,40 @@ class TestWatchTaskConflict:
         assert task is not None
 
     @pytest.mark.asyncio
+    async def test_conflict_when_task_exists_but_hidden_by_other_agent(
+        self, resource_service: ResourceService, request_context: RequestContext
+    ):
+        to_uri = "viking://resources/cross_agent_conflict"
+        other_agent_ctx = RequestContext(
+            user=UserIdentifier("test_account", "test_user", "other_agent"),
+            role=Role.USER,
+        )
+
+        await resource_service.add_resource(
+            path="/test/path1",
+            ctx=request_context,
+            to=to_uri,
+            watch_interval=30.0,
+        )
+
+        hidden_task = await get_task_by_uri(resource_service, to_uri, other_agent_ctx)
+        assert hidden_task is None
+
+        with pytest.raises(ConflictError) as exc_info:
+            await resource_service.add_resource(
+                path="/test/path2",
+                ctx=other_agent_ctx,
+                to=to_uri,
+                watch_interval=45.0,
+            )
+
+        assert "already used by another task" in str(exc_info.value)
+        assert to_uri in str(exc_info.value)
+
+        original_task = await get_task_by_uri(resource_service, to_uri, request_context)
+        assert original_task is not None
+
+    @pytest.mark.asyncio
     async def test_reactivate_inactive_task(
         self, resource_service: ResourceService, request_context: RequestContext
     ):
@@ -287,6 +322,7 @@ class TestWatchTaskConflict:
             account_id=request_context.account_id,
             user_id=request_context.user.user_id,
             role=request_context.role.value,
+            agent_id=request_context.user.agent_id,
             is_active=False,
         )
 
@@ -380,6 +416,34 @@ class TestWatchTaskCancellation:
 
         assert result is not None
 
+    @pytest.mark.asyncio
+    async def test_cancel_does_not_touch_other_agent_task(
+        self, resource_service: ResourceService, request_context: RequestContext
+    ):
+        to_uri = "viking://resources/cancel_other_agent"
+        other_agent_ctx = RequestContext(
+            user=UserIdentifier("test_account", "test_user", "other_agent"),
+            role=Role.USER,
+        )
+
+        await resource_service.add_resource(
+            path="/test/path",
+            ctx=request_context,
+            to=to_uri,
+            watch_interval=30.0,
+        )
+
+        await resource_service.add_resource(
+            path="/test/path",
+            ctx=other_agent_ctx,
+            to=to_uri,
+            watch_interval=0,
+        )
+
+        original_task = await get_task_by_uri(resource_service, to_uri, request_context)
+        assert original_task is not None
+        assert original_task.is_active is True
+
 
 class TestWatchTaskUpdate:
     """Tests for watch task update."""
@@ -409,6 +473,7 @@ class TestWatchTaskUpdate:
             account_id=request_context.account_id,
             user_id=request_context.user.user_id,
             role=request_context.role.value,
+            agent_id=request_context.user.agent_id,
             is_active=False,
         )
 
