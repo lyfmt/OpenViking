@@ -527,9 +527,7 @@ class TestWatchManager:
         assert tasks == []
 
     @pytest.mark.asyncio
-    async def test_user_cannot_update_or_delete_other_agent_task(
-        self, watch_manager: WatchManager
-    ):
+    async def test_user_cannot_update_or_delete_other_agent_task(self, watch_manager: WatchManager):
         task = await watch_manager.create_task(
             path="/test/path",
             to_uri="viking://resources/agent-update-delete",
