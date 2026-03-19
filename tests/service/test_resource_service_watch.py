@@ -11,8 +11,7 @@ import pytest_asyncio
 from openviking.resource.watch_manager import WatchManager
 from openviking.server.identity import RequestContext, Role
 from openviking.service.resource_service import ResourceService
-from openviking_cli.exceptions import ConflictError
-from openviking_cli.exceptions import InvalidArgumentError
+from openviking_cli.exceptions import ConflictError, InvalidArgumentError
 from openviking_cli.session.user_id import UserIdentifier
 
 
