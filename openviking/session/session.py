@@ -7,6 +7,7 @@ Session as Context: Sessions integrated into L0/L1/L2 system.
 
 import json
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -16,6 +17,7 @@ from openviking.message import Message, Part
 from openviking.server.identity import RequestContext, Role
 from openviking.telemetry import get_current_telemetry
 from openviking.utils.time_utils import get_current_timestamp
+from openviking_cli.exceptions import ConflictError
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger, run_async
 from openviking_cli.utils.config import get_openviking_config
@@ -26,6 +28,7 @@ if TYPE_CHECKING:
     from openviking.storage.viking_fs import VikingFS
 
 logger = get_logger(__name__)
+_DEFAULT_SESSION_MUTATION_LOCK_TIMEOUT = 1.0
 
 
 @dataclass
@@ -94,10 +97,14 @@ class Session:
 
         logger.info(f"Session created: {self.session_id} for user {self.user}")
 
-    async def load(self):
+    async def load(self, force: bool = False):
         """Load session data from storage."""
-        if self._loaded:
+        if self._loaded and not force:
             return
+
+        self._messages = []
+        self._compression.compression_index = 0
+        self._stats.compression_count = 0
 
         try:
             content = await self._viking_fs.read_file(
@@ -126,6 +133,8 @@ class Session:
         except Exception:
             pass
 
+        self._stats.total_turns = len([m for m in self._messages if m.role == "user"])
+        self._stats.total_tokens = sum(len(m.content) // 4 for m in self._messages)
         self._loaded = True
 
     async def exists(self) -> bool:
@@ -138,10 +147,8 @@ class Session:
 
     async def ensure_exists(self) -> None:
         """Materialize session root and messages file if missing."""
-        if await self.exists():
-            return
         await self._viking_fs.mkdir(self._session_uri, exist_ok=True, ctx=self.ctx)
-        await self._viking_fs.write_file(f"{self._session_uri}/messages.jsonl", "", ctx=self.ctx)
+        await self._ensure_messages_file_exists()
 
     @property
     def messages(self) -> List[Message]:
@@ -181,21 +188,30 @@ class Session:
         parts: List[Part],
     ) -> Message:
         """Add a message."""
-        msg = Message(
-            id=f"msg_{uuid4().hex}",
-            role=role,
-            parts=parts,
-            created_at=datetime.now(),
-        )
-        self._messages.append(msg)
+        return run_async(self._add_message_async(role, parts))
 
-        # Update statistics
-        if role == "user":
-            self._stats.total_turns += 1
-        self._stats.total_tokens += len(msg.content) // 4
+    async def _add_message_async(
+        self,
+        role: str,
+        parts: List[Part],
+    ) -> Message:
+        """Async implementation of add_message with shared-session serialization."""
+        async with self._session_mutation_lock(refresh_state=True, create_if_missing=True):
+            msg = Message(
+                id=f"msg_{uuid4().hex}",
+                role=role,
+                parts=parts,
+                created_at=datetime.now(),
+            )
+            self._messages.append(msg)
 
-        self._append_to_jsonl(msg)
-        return msg
+            # Update statistics
+            if role == "user":
+                self._stats.total_turns += 1
+            self._stats.total_tokens += len(msg.content) // 4
+
+            await self._append_to_jsonl_async(msg)
+            return msg
 
     def update_tool_part(
         self,
@@ -205,19 +221,33 @@ class Session:
         status: str = "completed",
     ) -> None:
         """Update tool status."""
-        msg = next((m for m in self._messages if m.id == message_id), None)
-        if not msg:
-            return
+        run_async(self._update_tool_part_async(message_id, tool_id, output, status))
 
-        tool_part = msg.find_tool_part(tool_id)
-        if not tool_part:
-            return
+    async def _update_tool_part_async(
+        self,
+        message_id: str,
+        tool_id: str,
+        output: str,
+        status: str = "completed",
+    ) -> None:
+        """Async implementation of update_tool_part with shared-session serialization."""
+        async with self._session_mutation_lock(refresh_state=True) as locked:
+            if not locked:
+                return
 
-        tool_part.tool_output = output
-        tool_part.tool_status = status
+            msg = next((m for m in self._messages if m.id == message_id), None)
+            if not msg:
+                return
 
-        self._save_tool_result(tool_id, msg, output, status)
-        self._update_message_in_jsonl()
+            tool_part = msg.find_tool_part(tool_id)
+            if not tool_part:
+                return
+
+            tool_part.tool_output = output
+            tool_part.tool_status = status
+
+            await self._save_tool_result_async(tool_id, msg, output, status)
+            await self._update_message_in_jsonl_async()
 
     def commit(self) -> Dict[str, Any]:
         """Sync wrapper for commit_async()."""
@@ -628,27 +658,35 @@ class Session:
         """Append to messages.jsonl."""
         if not self._viking_fs:
             return
-        run_async(
-            self._viking_fs.append_file(
-                f"{self._session_uri}/messages.jsonl",
-                msg.to_jsonl() + "\n",
-                ctx=self.ctx,
-            )
+        run_async(self._append_to_jsonl_async(msg))
+
+    async def _append_to_jsonl_async(self, msg: Message) -> None:
+        """Async append to messages.jsonl."""
+        if not self._viking_fs:
+            return
+        await self._viking_fs.append_file(
+            f"{self._session_uri}/messages.jsonl",
+            msg.to_jsonl() + "\n",
+            ctx=self.ctx,
         )
 
     def _update_message_in_jsonl(self) -> None:
         """Update message in messages.jsonl."""
         if not self._viking_fs:
             return
+        run_async(self._update_message_in_jsonl_async())
+
+    async def _update_message_in_jsonl_async(self) -> None:
+        """Async rewrite messages.jsonl from current in-memory messages."""
+        if not self._viking_fs:
+            return
 
         lines = [m.to_jsonl() for m in self._messages]
         content = "\n".join(lines) + "\n"
-        run_async(
-            self._viking_fs.write_file(
-                f"{self._session_uri}/messages.jsonl",
-                content,
-                ctx=self.ctx,
-            )
+        await self._viking_fs.write_file(
+            f"{self._session_uri}/messages.jsonl",
+            content,
+            ctx=self.ctx,
         )
 
     def _save_tool_result(
@@ -659,6 +697,16 @@ class Session:
         status: str,
     ) -> None:
         """Save tool result to tools/{tool_id}/tool.json."""
+        run_async(self._save_tool_result_async(tool_id, msg, output, status))
+
+    async def _save_tool_result_async(
+        self,
+        tool_id: str,
+        msg: Message,
+        output: str,
+        status: str,
+    ) -> None:
+        """Async save tool result to tools/{tool_id}/tool.json."""
         if not self._viking_fs:
             return
 
@@ -678,13 +726,72 @@ class Session:
             "prompt_tokens": tool_part.prompt_tokens,
             "completion_tokens": tool_part.completion_tokens,
         }
-        run_async(
-            self._viking_fs.write_file(
-                f"{self._session_uri}/tools/{tool_id}/tool.json",
-                json.dumps(tool_data, ensure_ascii=False),
-                ctx=self.ctx,
-            )
+        await self._viking_fs.write_file(
+            f"{self._session_uri}/tools/{tool_id}/tool.json",
+            json.dumps(tool_data, ensure_ascii=False),
+            ctx=self.ctx,
         )
+
+    async def _ensure_messages_file_exists(self) -> None:
+        """Create messages.jsonl lazily without overwriting an existing session."""
+        if not self._viking_fs:
+            return
+        messages_uri = f"{self._session_uri}/messages.jsonl"
+        try:
+            await self._viking_fs.stat(messages_uri, ctx=self.ctx)
+        except Exception:
+            await self._viking_fs.write_file(messages_uri, "", ctx=self.ctx)
+
+    @asynccontextmanager
+    async def _session_mutation_lock(
+        self,
+        *,
+        refresh_state: bool = False,
+        create_if_missing: bool = False,
+    ):
+        """Serialize shared-session mutations across same-user multi-agent instances."""
+        from openviking.storage.transaction import get_lock_manager
+
+        if not self._viking_fs:
+            yield False
+            return
+
+        if create_if_missing:
+            await self._viking_fs.mkdir(self._session_uri, exist_ok=True, ctx=self.ctx)
+        elif not await self.exists():
+            if refresh_state:
+                await self.load(force=True)
+            yield False
+            return
+
+        session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
+        lock_manager = get_lock_manager()
+        handle = lock_manager.create_handle()
+        timeout = self._session_mutation_lock_timeout()
+
+        try:
+            acquired = await lock_manager.acquire_subtree(handle, session_path, timeout=timeout)
+            if not acquired:
+                raise ConflictError(
+                    f"Session {self.session_id} is being modified by another operation",
+                    resource=self.session_id,
+                )
+            await self._ensure_messages_file_exists()
+            if refresh_state:
+                await self.load(force=True)
+            yield True
+        finally:
+            await lock_manager.release(handle)
+
+    def _session_mutation_lock_timeout(self) -> float:
+        """Use a short bounded wait for interactive shared-session mutations."""
+        try:
+            configured = float(get_openviking_config().transaction.lock_timeout)
+        except Exception:
+            configured = 0.0
+        if configured > 0:
+            return configured
+        return _DEFAULT_SESSION_MUTATION_LOCK_TIMEOUT
 
     def _generate_abstract(self) -> str:
         """Generate one-sentence summary for session."""
